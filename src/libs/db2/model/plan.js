@@ -20,7 +20,7 @@
 
 'use strict';
 
-import { flatten } from 'lodash';
+import { flatten, has } from 'lodash';
 import GrazingSchedule from './grazingschedule';
 import Model from './model';
 import Pasture from './pasture';
@@ -41,6 +41,30 @@ import PlantCommunityAction from './plantcommunityaction';
 import GrazingScheduleEntry from './grazingscheduleentry';
 import MinisterIssueAction from './ministerissueaction';
 import MinisterIssuePasture from './ministerissuepasture';
+
+const duplicateEach = async (db, model, rows, map, finishedCb) => {
+  const promises = rows.map(
+    async (row) => {
+      if (has(row, 'id')) {
+        const { id, ...rowData } = row;
+
+        const newRow = await model.create(db, map(rowData));
+        return [newRow, { ...row, id }];
+      }
+
+      const newRow = await model.create(db, map(row));
+      return [newRow, row];
+    },
+  );
+
+  const newRows = await Promise.all(promises);
+
+  if (finishedCb) {
+    return Promise.all(newRows.map(finishedCb));
+  }
+
+  return newRows.map(([newRow]) => newRow);
+};
 
 export default class Plan extends Model {
   constructor(data, db = undefined) {
@@ -165,77 +189,60 @@ export default class Plan extends Model {
     try {
       db.raw('BEGIN');
 
-      const pasturePromises = plan.pastures.map(
-        async ({ id: pastureId, ...pasture }) => {
-          const newPasture = await Pasture.create(db, {
-            ...pasture,
-            plan_id: newPlan.id,
-          });
-
-          const plantCommunityPromises = pasture.plantCommunities.map(
-            async ({ id: plantCommunityId, ...plantCommunity }) => {
-              const newPlantCommunity = await PlantCommunity.create(db, {
-                ...plantCommunity,
-                pasture_id: newPasture.id,
-              });
-
-              const indicatorPlantPromises = plantCommunity.indicatorPlants.map(
-                async ({ id: indicatorPlantId, ...indicatorPlant }) => {
-                  const newIndicatorPlant = await IndicatorPlant.create(db, {
-                    ...indicatorPlant,
-                    plant_community_id: newPlantCommunity.id,
-                  });
-
-                  return newIndicatorPlant;
-                },
+      // Duplicate pastures
+      const newPastures = await duplicateEach(
+        db,
+        Pasture,
+        plan.pastures,
+        pasture => ({ ...pasture, plan_id: newPlan.id }),
+        async ([newPasture, oldPasture]) => {
+          // Duplicate plant communities
+          const newPlantCommunities = await duplicateEach(
+            db,
+            PlantCommunity,
+            oldPasture.plantCommunities,
+            pc => ({ ...pc, pasture_id: newPasture.id }),
+            async ([newCommunity, oldCommunity]) => {
+              // Duplicate indicator plants
+              const newIndicatorPlants = await duplicateEach(
+                db,
+                IndicatorPlant,
+                oldCommunity.indicatorPlants,
+                ip => ({ ...ip, plant_community_id: newCommunity.id }),
               );
 
-              const newIndicatorPlants = await Promise.all(indicatorPlantPromises);
-
-              const monitoringAreaPromises = plantCommunity.monitoringAreas.map(
-                async ({ id: monitoringAreaId, ...monitoringArea }) => {
-                  const newMonitoringArea = await MonitoringArea.create(db, {
-                    ...monitoringArea,
-                    plant_community_id: newPlantCommunity.id,
-                  });
-
-                  const purposePromises = monitoringArea.purposes.map(
-                    async ({ id: purposeId, ...purpose }) => {
-                      const newPurpose = await MonitoringAreaPurpose.create(db, {
-                        ...purpose,
-                        monitoring_area_id: newMonitoringArea.id,
-                      });
-
-                      return newPurpose;
-                    },
+              // Duplicate monitoring areas
+              const newMonitoringAreas = await duplicateEach(
+                db,
+                MonitoringArea,
+                oldCommunity.monitoringAreas,
+                area => ({ ...area, plant_community_id: newCommunity.id }),
+                async ([newArea, oldArea]) => {
+                  // Duplicate monitoring area purposes
+                  const newPurposes = await duplicateEach(
+                    db,
+                    MonitoringAreaPurpose,
+                    oldArea.purposes,
+                    purpose => ({ ...purpose, monitoring_area_id: newArea.id }),
                   );
 
-                  const newPurposes = await Promise.all(purposePromises);
-
                   return {
-                    ...newMonitoringArea,
-                    monitoringAreaPurposes: newPurposes,
+                    ...newArea,
+                    purposes: newPurposes,
                   };
                 },
               );
 
-              const newMonitoringAreas = await Promise.all(monitoringAreaPromises);
-
-              const actionPromises = plantCommunity.plantCommunityActions.map(
-                async ({ id: actionId, ...action }) => {
-                  const newAction = await PlantCommunityAction.create(db, {
-                    ...action,
-                    plant_community_id: newPlantCommunity.id,
-                  });
-
-                  return newAction;
-                },
+              // Duplicate plant community actions
+              const newActions = await duplicateEach(
+                db,
+                PlantCommunityAction,
+                oldCommunity.plantCommunityActions,
+                action => ({ ...action, plant_community_id: newCommunity.id }),
               );
 
-              const newActions = await Promise.all(actionPromises);
-
               return {
-                ...newPlantCommunity,
+                ...newCommunity,
                 indicatorPlants: newIndicatorPlants,
                 monitoringAreas: newMonitoringAreas,
                 plantCommunityActions: newActions,
@@ -243,40 +250,35 @@ export default class Plan extends Model {
             },
           );
 
-          const newPlantCommunities = await Promise.all(plantCommunityPromises);
-
-
           return {
             ...newPasture,
             plantCommunities: newPlantCommunities,
-            original: { id: pastureId, ...pasture },
+            original: oldPasture,
           };
         },
       );
 
-      const newPastures = await Promise.all(pasturePromises);
-
-      const schedulePromises = plan.grazingSchedules.map(
-        async ({ id: scheduleId, ...schedule }) => {
-          const newSchedule = await GrazingSchedule.create(db, {
-            ...schedule,
-            plan_id: newPlan.id,
-          });
-
-          const entryPromises = schedule.grazingScheduleEntries.map(
-            async ({ id: entryId, ...entry }) => {
+      // Duplicate grazing schedules
+      const newGrazingSchedules = await duplicateEach(
+        db,
+        GrazingSchedule,
+        plan.grazingSchedules,
+        schedule => ({ ...schedule, plan_id: newPlan.id }),
+        async ([oldSchedule, newSchedule]) => {
+          // Duplicate grazing schedule entries
+          const newEntries = await duplicateEach(
+            db,
+            GrazingScheduleEntry,
+            oldSchedule.grazingScheduleEntries,
+            (entry) => {
               const pasture = newPastures.find(p => p.original.id === entry.pastureId);
-              const newEntry = await GrazingScheduleEntry.create(db, {
+              return {
                 ...entry,
                 grazing_schedule_id: newSchedule.id,
                 pasture_id: pasture.id,
-              });
-
-              return newEntry;
+              };
             },
           );
-
-          const newEntries = await Promise.all(entryPromises);
 
           return {
             ...newSchedule,
@@ -285,55 +287,42 @@ export default class Plan extends Model {
         },
       );
 
-      const newGrazingSchedules = await Promise.all(schedulePromises);
-
-      const additionalRequirementPromises = plan.additionalRequirements.map(
-        async ({ id: requirementId, ...requirement }) => {
-          const newRequirement = await AdditionalRequirement.create(db, {
-            ...requirement,
-            plan_id: newPlan.id,
-          });
-
-          return newRequirement;
-        },
+      // Duplicate additional requirements
+      const newAdditionalRequirements = await duplicateEach(
+        db,
+        AdditionalRequirement,
+        plan.additionalRequirements,
+        requirement => ({ ...requirement, plan_id: newPlan.id }),
       );
 
-      const newAdditionalRequirements = await Promise.all(additionalRequirementPromises);
-
-      const ministerIssuePromises = plan.ministerIssues.map(
-        async ({ id: issueId, ...issue }) => {
-          const newIssue = await MinisterIssue.create(db, {
-            ...issue,
-            plan_id: newPlan.id,
-          });
-
-          const actionPromises = issue.ministerIssueActions.map(
-            async ({ id: actionId, ...action }) => {
-              const newAction = await MinisterIssueAction.create(db, {
-                ...action,
-                minister_issue_id: newIssue.id,
-              });
-
-
-              return newAction;
-            },
+      // Duplicate minister issues
+      const newMinisterIssues = await duplicateEach(
+        db,
+        MinisterIssue,
+        plan.ministerIssues,
+        issue => ({ ...issue, plan_id: newPlan.id }),
+        async ([newIssue, oldIssue]) => {
+          // Duplicate minister issue actions
+          const newActions = await duplicateEach(
+            db,
+            MinisterIssueAction,
+            oldIssue.ministerIssueActions,
+            action => ({ ...action, minister_issue_id: newIssue.id }),
           );
 
-          const newActions = await Promise.all(actionPromises);
-
-          const ministerPasturePromises = issue.pastures.map(
-            async (pastureId) => {
-              const pasture = newPastures.find(p => p.original.id === pastureId);
-              const newPasture = await MinisterIssuePasture.create(db, {
-                pasture_id: pasture.id,
+          // Duplicate minister issue pastures
+          const newMinisterPastures = await duplicateEach(
+            db,
+            MinisterIssuePasture,
+            oldIssue.pastures,
+            (pastureId) => {
+              const newPasture = newPastures.find(p => p.original.id === pastureId);
+              return {
+                pasture_id: newPasture.id,
                 minister_issue_id: newIssue.id,
-              });
-
-              return newPasture;
+              };
             },
           );
-
-          const newMinisterPastures = await Promise.all(ministerPasturePromises);
 
           return {
             ...newIssue,
@@ -343,20 +332,13 @@ export default class Plan extends Model {
         },
       );
 
-      const newMinisterIssues = await Promise.all(ministerIssuePromises);
-
-      const managementConsiderationPromises = plan.managementConsiderations.map(
-        async ({ id: considerationId, ...consideration }) => {
-          const newConsideration = await ManagementConsideration.create(db, {
-            ...consideration,
-            plan_id: newPlan.id,
-          });
-
-          return newConsideration;
-        },
+      // Duplicate management considerations
+      const newConsiderations = await duplicateEach(
+        db,
+        ManagementConsideration,
+        plan.managementConsiderations,
+        consideration => ({ ...consideration, plan_id: newPlan.id }),
       );
-
-      const newConsiderations = await Promise.all(managementConsiderationPromises);
 
       db.raw('COMMIT');
 
