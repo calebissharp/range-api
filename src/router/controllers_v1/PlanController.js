@@ -33,82 +33,70 @@ export default class PlanController {
     );
 
     try {
-
       const [plan] = await Plan.findWithStatusExtension(db, { 'plan.id': planId }, ['id', 'desc']);
       if (!plan) {
         throw errorWithCode('Plan doesn\'t exist', 404);
       }
 
       const { agreementId } = plan;
-      const  status_id  = plan.status["id"];
 
-      const  isStaff = user.isAdministrator()? true : user.isRangeOfficer()? true : false;
-      const  isAH = user.isAgreementHolder()? true : false;
+      const isStaff = user.isAdministrator() ? true : !!user.isRangeOfficer();
 
-      var privacyVersion; 
-      var privacyVersionRaw; 
-      if(isStaff) {
-        privacyVersionRaw = (await PlanSnapshot.findSummary(db, {plan_id: planId, privacyview: 'StaffView'}))[0];
-        privacyVersion = (privacyVersionRaw == null)? null : privacyVersionRaw.snapshot;
-        logger.info(JSON.stringify(privacyVersion));
-      }
-      else {
-        privacyVersionRaw = (await PlanSnapshot.findSummary(db, {plan_id: planId, privacyview: 'AHView'}))[0];
-        privacyVersion = (privacyVersionRaw == null)? null : privacyVersionRaw.snapshot;
-      }
-        
-      const shouldBeLiveVersion = (privacyVersion == null)? true : false;
-      logger.info('shouldBeLiveVersion: ' + shouldBeLiveVersion);
+      const [privacyVersionRaw] = await PlanSnapshot.findSummary(db, {
+        plan_id: planId,
+        privacyview: isStaff ? 'StaffView' : 'AHView',
+      });
+      const privacyVersion = privacyVersionRaw?.snapshot ?? null;
+      logger.info(
+        `Privacy version for plan ${planId}, user: ${user.id} (${isStaff ? 'staff' : 'not staff'})`,
+        JSON.stringify(privacyVersion),
+      );
+
+      const shouldBeLiveVersion = (privacyVersion === null);
+      logger.info(`shouldBeLiveVersion: ${shouldBeLiveVersion}`);
 
       await PlanRouteHelper.canUserAccessThisAgreement(db, Agreement, user, agreementId);
 
       const [agreement] = await Agreement.findWithTypeZoneDistrictExemption(
         db, { forest_file_id: agreementId },
       );
-      await agreement.eagerloadAllOneToManyExceptPlan();//todo determine if this matters 
+      await agreement.eagerloadAllOneToManyExceptPlan();
       agreement.transformToV1();
 
-        
-      if(shouldBeLiveVersion)
-      {
-          logger.info('loading live plan')
-            await plan.eagerloadAllOneToMany();
-          plan.agreement = agreement;
 
-          const mappedGrazingSchedules = await Promise.all(
-            plan.grazingSchedules.map(async schedule => ({
-              ...schedule,
-              sortBy: schedule.sortBy && objPathToCamelCase(schedule.sortBy),
-            })),
-          );
+      if (shouldBeLiveVersion) {
+        logger.info('loading live plan');
+        await plan.eagerloadAllOneToMany();
+        plan.agreement = agreement;
 
-          return res.status(200).json({
-            ...plan,
-            grazingSchedules: mappedGrazingSchedules,
-          }).end();
-      }
-      else
-      {
-        logger.info('loading last version')
+        const mappedGrazingSchedules = await Promise.all(
+          plan.grazingSchedules.map(async schedule => ({
+            ...schedule,
+            sortBy: schedule.sortBy && objPathToCamelCase(schedule.sortBy),
+          })),
+        );
 
-          delete privacyVersion.status;
-          privacyVersion.status = plan.status;
-          delete privacyVersion.status_id;
-          privacyVersion.status_id = status_id;
-          logger.info(JSON.stringify(privacyVersion));
-          return res.status(200).json({
-              ...privacyVersion
-          }).end();
-        }
-      
+        return res.status(200).json({
+          ...plan,
+          grazingSchedules: mappedGrazingSchedules,
+        }).end();
       }
 
-         catch (error) {
-          logger.error(`Unable to fetch plan, error: ${error.message}`);
-          throw errorWithCode(`There was a problem fetching the record. Error: ${error.message}`, error.code || 500);
-         }
+      logger.info('loading last version');
 
+      logger.info(JSON.stringify(privacyVersion));
+
+      return res.status(200).json({
+        ...privacyVersion,
+        statusId: plan.status.id,
+        status: plan.status,
+      }).end();
+    } catch (error) {
+      logger.error(`Unable to fetch plan, error: ${error.message}`);
+      throw errorWithCode(`There was a problem fetching the record. Error: ${error.message}`, error.code || 500);
+    }
   }
+
   /**
    * Create Plan
    * @param {*} req : express req object
